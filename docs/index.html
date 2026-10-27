@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gesture Control — Webcam Demo</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #0b1220;
+    color: #e2e8f0;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.6rem; margin: 0 0 8px; }
+  .honest {
+    color: #94a3b8;
+    font-size: 0.95rem;
+    margin: 0 0 24px;
+  }
+  .card {
+    background: #111c30;
+    border: 1px solid #1e293b;
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .stage { position: relative; background: #000; border-radius: 8px; overflow: hidden; }
+  #webcam, #overlay {
+    display: block;
+    width: 100%;
+    height: auto;
+    transform: scaleX(-1); /* selfie-view mirror: video and overlay flip together, so landmarks stay aligned */
+  }
+  #overlay { position: absolute; inset: 0; height: 100%; }
+  #label {
+    font-size: clamp(2rem, 8vw, 3.5rem);
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    text-align: center;
+    color: #38bdf8;
+    margin: 16px 0 4px;
+    min-height: 1.2em;
+  }
+  #detail {
+    text-align: center;
+    color: #94a3b8;
+    min-height: 1.4em;
+    margin: 0 0 12px;
+  }
+  #status {
+    text-align: center;
+    color: #cbd5e1;
+    font-size: 0.95rem;
+    margin: 0 0 12px;
+    min-height: 1.4em;
+  }
+  #status.error { color: #f87171; }
+  #webcamBtn {
+    display: block;
+    margin: 0 auto;
+    padding: 10px 24px;
+    font-size: 1rem;
+    font-weight: 600;
+    color: #082f49;
+    background: #38bdf8;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  #webcamBtn:disabled { opacity: 0.6; cursor: wait; }
+  h2 { font-size: 1.05rem; margin: 0 0 8px; color: #e2e8f0; }
+  ul { margin: 0; padding-left: 20px; color: #cbd5e1; line-height: 1.7; }
+  #log { list-style: none; padding-left: 0; color: #cbd5e1; line-height: 1.7; }
+  #log li span { color: #64748b; margin-right: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Gesture Control — Webcam Demo</h1>
+  <p class="honest">This demo only detects gestures on your webcam — it cannot move your computer&rsquo;s cursor. Only the Python app on your own PC does that.</p>
+
+  <div class="card">
+    <div class="stage">
+      <video id="webcam" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div id="label">NO HAND</div>
+    <p id="detail">Show your hand to the camera.</p>
+    <p id="status">Click &ldquo;Enable webcam&rdquo; to start.</p>
+    <button id="webcamBtn" type="button">Enable webcam</button>
+  </div>
+
+  <div class="card">
+    <h2>Gestures</h2>
+    <ul>
+      <li>Index finger only &rarr; Move</li>
+      <li>Thumb + index pinch &rarr; Click (once per pinch)</li>
+      <li>Two fingers, move up / down &rarr; Scroll</li>
+      <li>Open palm, swipe &rarr; Next / previous slide</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>Recent gestures</h2>
+    <ul id="log">
+      <li><span>--:--:--</span>No gestures yet.</li>
+    </ul>
+  </div>
+</main>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/vision_bundle.mjs";
+
+// ---------------------------------------------------------------------------
+// Gesture classifier: a direct port of gestures.py (same order of checks,
+// same thresholds). Landmarks are 21 {x, y} points in MediaPipe hand order.
+// The logic uses RAW camera coordinates, exactly like the Python app; only
+// the on-screen display is mirrored (see the CSS), so the swipe directions
+// match the Python app: a palm swipe that moves left across the mirrored
+// preview reads as SWIPE NEXT, same as the desktop app.
+// ---------------------------------------------------------------------------
+const WRIST = 0, THUMB_TIP = 4;
+const INDEX_PIP = 6, INDEX_TIP = 8;
+const MIDDLE_PIP = 10, MIDDLE_TIP = 12;
+const RING_PIP = 14, RING_TIP = 16;
+const PINKY_PIP = 18, PINKY_TIP = 20;
+
+const PINCH_THRESHOLD = 0.05;   // thumb tip <-> index tip distance
+const SCROLL_THRESHOLD = 0.015; // vertical finger movement per frame
+const SWIPE_THRESHOLD = 0.08;   // horizontal wrist movement
+const SWIPE_COOLDOWN = 1000;    // ms between slide changes
+
+function fingerUp(lm, tip, pip) { return lm[tip].y < lm[pip].y; }
+function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+
+const classifier = {
+  prevMidY: null,
+  prevWristX: null,
+  lastSwipeTime: -Infinity,
+  pinching: false,
+  resetMotion() { this.prevMidY = null; this.prevWristX = null; },
+  classify(lm) {
+    if (!lm) {
+      this.resetMotion();
+      this.pinching = false;
+      return { gesture: "none" };
+    }
+    const indexUp = fingerUp(lm, INDEX_TIP, INDEX_PIP);
+    const middleUp = fingerUp(lm, MIDDLE_TIP, MIDDLE_PIP);
+    const ringUp = fingerUp(lm, RING_TIP, RING_PIP);
+    const pinkyUp = fingerUp(lm, PINKY_TIP, PINKY_PIP);
+
+    // 1. Thumb-index pinch -> click (rising edge only).
+    if (indexUp && dist(lm[THUMB_TIP], lm[INDEX_TIP]) < PINCH_THRESHOLD) {
+      const edge = !this.pinching;
+      this.pinching = true;
+      this.resetMotion();
+      return { gesture: "click", edge };
+    }
+    this.pinching = false;
+
+    // 2. Index + middle up -> scroll from vertical finger movement.
+    if (indexUp && middleUp && !ringUp && !pinkyUp) {
+      const midY = (lm[INDEX_TIP].y + lm[MIDDLE_TIP].y) / 2;
+      let amount = 0;
+      if (this.prevMidY !== null) {
+        const dy = this.prevMidY - midY; // > 0 when fingers move up
+        if (Math.abs(dy) >= SCROLL_THRESHOLD) {
+          amount = Math.max(1, Math.min(10, Math.trunc(Math.abs(dy) * 40)));
+          amount = dy > 0 ? amount : -amount;
+        }
+      }
+      this.prevMidY = midY;
+      this.prevWristX = null;
+      return { gesture: "scroll", amount };
+    }
+
+    // 3. Open palm -> horizontal swipe (with cooldown), else "palm".
+    if (indexUp && middleUp && ringUp && pinkyUp) {
+      const now = performance.now();
+      if (now - this.lastSwipeTime < SWIPE_COOLDOWN) {
+        // Cooling down after a swipe: disarm so the next swipe needs
+        // fresh movement, not leftover motion.
+        this.prevWristX = null;
+        this.prevMidY = null;
+        return { gesture: "palm" };
+      }
+      const wristX = lm[WRIST].x;
+      if (this.prevWristX !== null) {
+        const dx = wristX - this.prevWristX;
+        if (dx >= SWIPE_THRESHOLD) {
+          this.lastSwipeTime = now;
+          this.prevWristX = null;
+          this.prevMidY = null;
+          return { gesture: "swipe_right" };
+        }
+        if (dx <= -SWIPE_THRESHOLD) {
+          this.lastSwipeTime = now;
+          this.prevWristX = null;
+          this.prevMidY = null;
+          return { gesture: "swipe_left" };
+        }
+      }
+      this.prevWristX = wristX;
+      this.prevMidY = null;
+      return { gesture: "palm" };
+    }
+
+    // 4. Index finger only -> move.
+    if (indexUp && !middleUp && !ringUp && !pinkyUp) {
+      this.resetMotion();
+      return { gesture: "move", point: lm[INDEX_TIP] };
+    }
+
+    // Anything else (e.g. a fist) -> do nothing.
+    this.resetMotion();
+    return { gesture: "none" };
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Page wiring: webcam, MediaPipe HandLandmarker, canvas overlay, log.
+// ---------------------------------------------------------------------------
+const video = document.getElementById("webcam");
+const canvas = document.getElementById("overlay");
+const ctx = canvas.getContext("2d");
+const labelEl = document.getElementById("label");
+const detailEl = document.getElementById("detail");
+const statusEl = document.getElementById("status");
+const btn = document.getElementById("webcamBtn");
+const logEl = document.getElementById("log");
+
+let handLandmarker = null;
+let stream = null;
+let running = false;
+let lastVideoTime = -1;
+let lastScrollLog = 0;
+let logStarted = false;
+
+function setStatus(text, isError) {
+  statusEl.textContent = text;
+  statusEl.classList.toggle("error", !!isError);
+}
+
+function addLog(text) {
+  if (!logStarted) { logEl.innerHTML = ""; logStarted = true; }
+  const li = document.createElement("li");
+  const time = document.createElement("span");
+  time.textContent = new Date().toLocaleTimeString();
+  li.appendChild(time);
+  li.appendChild(document.createTextNode(text));
+  logEl.prepend(li);
+  while (logEl.children.length > 8) logEl.removeChild(logEl.lastChild);
+}
+
+function showResult(out) {
+  let label = "NO HAND";
+  let detail = "Show your hand to the camera.";
+  if (out.gesture === "move") {
+    label = "MOVE";
+    detail = "Index finger only.";
+  } else if (out.gesture === "click") {
+    label = "CLICK";
+    detail = out.edge ? "Pinch — click fired." : "Pinch held.";
+    if (out.edge) addLog("CLICK");
+  } else if (out.gesture === "scroll") {
+    if (out.amount > 0) {
+      label = "SCROLL UP";
+      detail = "Two fingers moving up.";
+      if (performance.now() - lastScrollLog > 500) { addLog("SCROLL UP"); lastScrollLog = performance.now(); }
+    } else if (out.amount < 0) {
+      label = "SCROLL DOWN";
+      detail = "Two fingers moving down.";
+      if (performance.now() - lastScrollLog > 500) { addLog("SCROLL DOWN"); lastScrollLog = performance.now(); }
+    } else {
+      label = "SCROLL";
+      detail = "Two fingers held still.";
+    }
+  } else if (out.gesture === "swipe_right") {
+    label = "SWIPE NEXT";
+    detail = "Open palm swiped — next slide.";
+    addLog("SWIPE NEXT");
+  } else if (out.gesture === "swipe_left") {
+    label = "SWIPE PREV";
+    detail = "Open palm swiped — previous slide.";
+    addLog("SWIPE PREV");
+  } else if (out.gesture === "palm") {
+    label = "PALM";
+    detail = "Open palm — swipe to change slide.";
+  }
+  labelEl.textContent = label;
+  detailEl.textContent = detail;
+}
+
+function drawLandmarks(landmarks) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!landmarks) return;
+  ctx.strokeStyle = "#38bdf8";
+  ctx.lineWidth = 2;
+  const connections = HandLandmarker.HAND_CONNECTIONS || [];
+  for (const c of connections) {
+    const a = landmarks[c.start], b = landmarks[c.end];
+    ctx.beginPath();
+    ctx.moveTo(a.x * canvas.width, a.y * canvas.height);
+    ctx.lineTo(b.x * canvas.width, b.y * canvas.height);
+    ctx.stroke();
+  }
+  ctx.fillStyle = "#f8fafc";
+  for (const p of landmarks) {
+    ctx.beginPath();
+    ctx.arc(p.x * canvas.width, p.y * canvas.height, 4, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+}
+
+function loop() {
+  if (!running) return;
+  requestAnimationFrame(loop);
+  if (!handLandmarker || video.readyState < 2) return;
+  if (video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const results = handLandmarker.detectForVideo(video, performance.now());
+  const landmarks = results.landmarks && results.landmarks.length > 0
+    ? results.landmarks[0]
+    : null;
+  drawLandmarks(landmarks);
+  showResult(classifier.classify(landmarks));
+}
+
+async function start() {
+  btn.disabled = true;
+  try {
+    setStatus("Starting camera…", false);
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
+    video.srcObject = stream;
+    await video.play();
+    if (canvas.width !== video.videoWidth) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+    }
+    if (!handLandmarker) {
+      setStatus("Loading hand-tracking model…", false);
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm"
+      );
+      const options = {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 1,
+        minHandDetectionConfidence: 0.5,
+        minHandPresenceConfidence: 0.5,
+        minTrackingConfidence: 0.5
+      };
+      try {
+        handLandmarker = await HandLandmarker.createFromOptions(vision, options);
+      } catch (e) {
+        // GPU delegate is not available everywhere; CPU always works.
+        options.baseOptions.delegate = "CPU";
+        handLandmarker = await HandLandmarker.createFromOptions(vision, options);
+      }
+    }
+    running = true;
+    lastVideoTime = -1;
+    setStatus("Ready — show your hand.", false);
+    btn.textContent = "Stop webcam";
+    btn.disabled = false;
+    requestAnimationFrame(loop);
+  } catch (err) {
+    stopTracks();
+    let message = "Could not start the demo: " + (err && err.message ? err.message : err);
+    if (err && err.name === "NotAllowedError") {
+      message = "Webcam access was denied. Allow camera access for this page and try again.";
+    } else if (err && (err.name === "NotFoundError" || err.name === "OverconstrainedError")) {
+      message = "No webcam found. Connect a webcam, close any other app using it, then try again.";
+    } else if (err && err.name === "NotReadableError") {
+      message = "The webcam is busy in another app or tab. Close it there and try again.";
+    }
+    setStatus(message, true);
+    btn.textContent = "Enable webcam";
+    btn.disabled = false;
+  }
+}
+
+function stopTracks() {
+  running = false;
+  if (stream) {
+    for (const track of stream.getTracks()) track.stop();
+    stream = null;
+  }
+  video.srcObject = null;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+btn.addEventListener("click", () => {
+  if (running) {
+    stopTracks();
+    labelEl.textContent = "NO HAND";
+    detailEl.textContent = "Show your hand to the camera.";
+    setStatus("Webcam stopped.", false);
+    btn.textContent = "Enable webcam";
+  } else {
+    start();
+  }
+});
+</script>
+</body>
+</html>
